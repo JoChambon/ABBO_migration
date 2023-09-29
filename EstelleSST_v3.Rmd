@@ -1,0 +1,445 @@
+---
+title: "Estelle SST"
+output: html_document
+---
+
+
+We assume that the data have been preprocessed to produce a suitable
+set of twilight data and a consistent initial path.
+
+Load `SGAT` and `BAStag`
+```{r}
+require(knitr)
+opts_knit$set(root.dir = "C:/Users/2029406/Desktop/Jo_ABBOTTS/ABBOTTS")
+library(SGAT)
+library(BAStag)
+library(tictoc)
+source("SGAT/colours.r")
+```
+
+
+## Configuration
+
+Load the configuration data generated in the preprocessing stage
+```{r}
+tic("Running time")
+source("GLS_files/0585/0585_config.r")
+if(diff(range(xlim))>360) xlim <- c(0,360)
+twl <- read.csv(paste0("GLS_files/", tag, "/", tagdata, "_twilight.csv"),header=T)
+twl$Twilight <- as.POSIXct(twl$Twilight,"GMT")
+path <- read.csv(paste0("GLS_files/", tag, "/", tagdata, "_essieSST.csv"),header=T)
+path <- list(time=as.POSIXct(path$time,"GMT"),x=cbind(path$lon,path$lat))
+fixed <- ifelse(twl$Marker <= nrow(fixed.locations),twl$Marker,0)
+```
+
+
+## Model Parameters
+
+Set the model parameters controlling the speed distribution and the
+distribution of twilight errors
+```{r}
+threshold
+zenith
+zenith0
+alpha
+beta
+```
+
+
+## Prior + SST
+
+We construct a sea mask that indicates when points on the path are at
+sea or fall out of the bounding box defined by `xlim` and `ylim` and use
+this to define a log prior that is applied to both the x and z
+points, and incorporate a contribution to the likelihood that assumes
+the observed sea surface temperature is Normally distributed about
+the Reynolds optimally interpolated SST.
+```{r}
+source("SGAT/SST.r")
+## Load sst data
+reynolds <- sstLogp(twl,xlim=xlim,ylim=ylim,land=F,sd=2,
+              src="Reynolds",path=
+                "C:/Users/2029406/Desktop/Jo_ABBOTTS/ABBOTTS/SGAT")
+
+# Define land mask
+is.sea <- landMask(xlim=xlim,ylim=ylim,n=4,land=F)
+
+## Define the log prior for x and z
+log.prior.x <- function(p)  {
+  logp <- reynolds$logp(p)
+  f <- is.sea(p)
+  ifelse(!is.na(f) & f,logp,-1000)
+}
+log.prior.z <- function(p)  {
+  f <- is.sea(p)
+  ifelse(!is.na(f) & f,0,-1000)
+}
+```
+
+## Initialization run
+
+Ideally the initial path would be chosen to meet the constraints imposed
+by the data, but this is no always easy, and so an initialization run
+is conducted.
+
+
+We derive the initial paths x0 and z0 and the fixed locations from the edited path.
+```{r}
+x0 <- as.matrix(path$x)
+z0 <- trackMidpts(x0)
+fixedx <- fixed > 0
+```
+
+When the model is defined, the `logp.x` and `logp.z` arguments are
+used to incorporate contributions from the prior to implement the sea
+mask
+
+```{r}
+model <- thresholdModel(twl$Twilight,twl$Rise,
+                         twilight.model="ModifiedLogNormal",
+                         alpha=alpha,beta=beta,
+                         logp.x=log.prior.x,logp.z=log.prior.z,
+                         x0=x0,z0=z0,zenith=zenith0,fixedx=fixedx)
+```
+
+The proposal distributions are defined
+```{r}
+proposal.x <- mvnorm(S=diag(c(0.005,0.005)),n=nlocation(x0))
+proposal.z <- mvnorm(S=diag(c(0.005,0.005)),n=nlocation(z0))
+```
+and all of the non-fixed locations are required to meet the conditions of
+the mask
+```{r,fig.show='hold'}
+fit <- estelleMetropolis(model,proposal.x,proposal.z,iters=1000,thin=60,chains=1)
+## Residuals are positive
+sapply(fit$x,function(x) all(fixedx | model$residuals(chainLast(x)) > 0))
+opar <- par(mfrow=c(2,1),mar=c(3,4,1,1)+0.1)
+## x locations are at sea
+plot(log.prior.x(chainLast(fit$x[[1]])),pch=16,cex=0.7,
+     xlab="",ylab="Log prior x")
+## z locations are at sea
+plot(log.prior.z(chainLast(fit$z[[1]])),pch=16,cex=0.7,
+     xlab="",ylab="Log prior z")
+par(opar)
+```
+
+## Tuning
+
+Once the chain meets the constraints of the model, the proposal
+distributions are tuned.
+
+The model is redefined
+```{r}
+x0 <- chainLast(fit$x)
+z0 <- chainLast(fit$z)
+model <- thresholdModel(twl$Twilight,twl$Rise,
+                         twilight.model="LogNormal",
+                         alpha=alpha,beta=beta,
+                         logp.x=log.prior.x,logp.z=log.prior.z,
+                         x0=x0,z0=z0,zenith=zenith0,fixedx=fixedx)
+proposal.x <- mvnorm(S=diag(c(0.005,0.005)),n=nlocation(x0))
+proposal.z <- mvnorm(S=diag(c(0.005,0.005)),n=nlocation(z0))
+```
+and a number of short runs are conducted
+```{r}
+fit <- estelleMetropolis(model,proposal.x,proposal.z,
+                          iters=1000,thin=60,chains=2)
+for(k in 1:3) {
+  proposal.x <- mvnorm(chainCov(fit$x),s=0.2)
+  proposal.z <- mvnorm(chainCov(fit$z),s=0.2)
+  fit <- estelleMetropolis(model,proposal.x,proposal.z,
+                            x0=chainLast(fit$x),
+                            z0=chainLast(fit$z),
+                            iters=1000,thin=60,chains=2)
+}
+```
+The samples drawn are checked
+```{r,fig.show='hold'}
+opar <- par(mfrow=c(2,2),mar=c(3,5,2,1)+0.1)
+for(k in 1:length(fit$x)) {
+    matplot(t(fit$x[[k]][!fixedx,1,]),type="l",lty=1,col=ci.col,ylab="Lon")
+    matplot(t(fit$x[[k]][!fixedx,2,]),type="l",lty=1,col=mn.col,ylab="Lat")
+}
+par(opar)
+```
+
+## Final Run
+
+Once the proposals are tuned, a larger final sample is drawn
+```{r}
+proposal.x <- mvnorm(chainCov(fit$x),s=0.25)
+proposal.z <- mvnorm(chainCov(fit$z),s=0.25)
+fit <- estelleMetropolis(model,proposal.x,proposal.z,
+                          x0=chainLast(fit$x),
+                          z0=chainLast(fit$z),
+                          iters=5000,thin=60,chains=4)
+```
+
+Corrections are made for fixed z
+```{r}
+## Fix the z locations.
+fixedz <- which(fixed[-length(fixed)] > 0 & fixed[-length(fixed)]==fixed[-1])
+for(k in 1:length(fit$z)) {
+    fit$z[[k]][fixedz,1,] <- fixed.locations[fixed[fixedz],1]
+    fit$z[[k]][fixedz,2,] <- fixed.locations[fixed[fixedz],2]
+}
+```
+
+
+## Diagnostics
+
+
+### Comparing Chains
+
+The results from the parallel chains are compared for consistency.
+
+
+A separate summary is generated for each chain
+```{r}
+s <- locationSummary(fit$x,time=model$time,collapse=F)
+```
+
+
+For each chain, plot the differences between the posterior mean of the
+chain and the posterior means of the other chains, together with the
+95% credible intervals for the deviation.
+```{r,fig.show='hold'}
+opar <- par(mfrow=c(2,2),mar=c(3,5,2,1)+0.1)
+for(k in 1:length(s)) {
+  ci <- as.matrix(s[[k]][,c("Lon.2.5%","Lon.97.5%")]-s[[k]][,"Lon.mean"])
+  ci[fixedx,] <- NA
+  matplot(s[[k]]$Time,ci,type="l",lty=1,ylab="Lon",xaxt="n",col=ci.col,
+          cex.axis=0.7)
+  axis.POSIXct(1,at=seq(round(min(s[[k]]$Time),"day"),
+                   round(max(s[[k]]$Time),"day"),"months"),
+               format="%d %b",cex.axis=0.7,las=2)
+  for(j in 1:length(s))
+    lines(s[[j]]$Time,s[[j]][,"Lon.mean"]-s[[k]][,"Lon.mean"],col=grp.pal[j])
+}
+par(opar)
+```
+
+
+```{r,fig.show='hold'}
+opar <- par(mfrow=c(2,2),mar=c(3,5,2,1)+0.1)
+for(k in 1:length(s)) {
+  ci <- as.matrix(s[[k]][,c("Lat.2.5%","Lat.97.5%")]-s[[k]][,"Lat.mean"])
+  ci[fixedx,] <- NA
+  matplot(s[[k]]$Time,ci,type="l",lty=1,ylab="Lat",xaxt="n",col=ci.col,
+          cex.axis=0.7)
+  axis.POSIXct(1,at=seq(round(min(s[[k]]$Time),"day"),
+                   round(max(s[[k]]$Time),"day"),"months"),
+               format="%d %b",cex.axis=0.7,las=2)
+  for(j in 1:length(s))
+    lines(s[[j]]$Time,s[[j]][,"Lat.mean"]-s[[k]][,"Lat.mean"],col=grp.pal[j])
+}
+par(opar)
+```
+
+
+Plot the sequence of posterior mean locations from each chain.
+```{r}
+library(maptools)
+data(wrld_simpl)
+plot(wrld_simpl,xlim=xlim,ylim=ylim,col=map1.col,border=map2.col)
+plot(elide(wrld_simpl,shift=c(360,0)),xlim=xlim,ylim=ylim,add=T,col=map1.col,
+     border=map2.col)
+for(k in 1:length(s)) {
+  lines(s[[k]][,"Lon.mean"],s[[k]][,"Lat.mean"],
+        col=rgb(t(col2rgb(grp.pal[k]))/255,alpha=0.4))
+}
+box()
+```
+
+
+Plot the posterior distribution of time spent at location derived from
+each chain.
+```{r,fig.show='hold'}
+library(maptools)
+data(wrld_simpl)
+fixedz <- fixed[-length(fixed)] > 0 & fixed[-length(fixed)]==fixed[-1]
+dt <- ifelse(fixedz,0,model$dt)
+im <- locationImage(fit$z,xlim=xlim,ylim=ylim,nx=4*diff(xlim),ny=4*diff(ylim),
+                    weight=dt,collapse=FALSE)
+opar <- par(mfrow=c(2,2),mar=c(2,2,2,2)+0.1)
+for(k in 1:length(im)) {
+  image(im[[k]]$x,im[[k]]$y,im[[k]]$W,xlab="",ylab="",cex.axis=0.7, xlim=xlim0,
+        ylim=ylim0)
+  plot(wrld_simpl,add=T,col=map1.col,border=map2.col)
+  plot(elide(wrld_simpl,shift=c(360,0)),add=T,col=map1.col,border=map2.col)
+  points(fixed.locations, pch=16, cex=1)
+  box()
+}
+par(opar)
+```
+
+
+
+### Diagnostic Predictions
+
+
+The distribution of the posterior predictions of the twilight
+errors for sunrise and sunset are compared to the  assumed
+distribution of twilight errors
+```{r}
+pr.res <- chainApply(fit$x,model$residuals)
+rs <- seq(0,quantile(pr.res,prob=0.98),length=200)
+ys <- dlnorm(rs,alpha[1],alpha[2])
+d1 <- density(pr.res[!fixedx & twl$Rise,])
+d2 <- density(pr.res[!fixedx & !twl$Rise,])
+plot(rs,ys,ylim=c(0,max(d1$y,d2$y,ys)),type="l",xlab="Minutes",ylab="",
+     col=asm.col,lwd=2)
+lines(d1,col=sr.col)
+lines(d2,col=ss.col)
+```
+
+We plot 95% credible intervals of the twilight residuals as a ribbon
+```{r,fig.show='hold'}
+opar <- par(mar=c(4,5,2,1)+0.1)
+qs <- t(apply(pr.res,1,quantile,prob=c(0.025,0.975)))
+plot(model$time,qs[,2],type="n",col=ci.col,
+     ylab="Minutes",xlab="",xaxt="n",cex.axis=0.7)
+axis.POSIXct(1,at=seq(round(min(model$time),"day"),
+                      round(max(model$time),"day"),"months"),
+             format="%d %b",las=2,cex.axis=0.7)
+polygon(c(model$time,rev(model$time)),
+        c(qs[,2],rev(qs[,1])),col=ci.col,border=NA)
+par(opar)
+```
+
+The posterior mean twilight times are shown against the light image.
+```{r}
+mn.twl <- .POSIXct(rowMeans(twl$Twilight+ifelse(twl$Rise,-60,60)*pr.res),"GMT")
+d.lig <- readLig(paste0("GLS_files/", tag, "/", tag, "_000.lig"))
+d.lig <- subset(d.lig,Date >= min(twl$Twilight)-72*60*60 & Date <= 
+                  max(twl$Twilight)+72*60*60)
+lightImage(d.lig,offset=offset)
+tsimageLines(mn.twl[twl$Rise],offset=offset,col=sr.col,lwd=2)
+tsimageLines(mn.twl[!twl$Rise],offset=offset,col=ss.col,lwd=2)
+```
+
+The posterior distribution of speeds is compared to the assumed
+distribution of speeds
+```{r}
+spd <- function(x,z)
+  pmax.int(trackDist2(x,z), 1e-06)/diff(as.numeric(twl$Twilight)/3600)
+fixedz <- fixed[-length(fixed)] > 0 & fixed[-length(fixed)]==fixed[-1]
+pr.spd <- chainApply2(fit$x,fit$z,spd)
+ss <- seq(0,quantile(pr.spd,prob=0.98),length=200)
+ys <- dgamma(ss,beta[1],beta[2])
+ds <- density(pr.spd[!fixedz,])
+plot(ss,ys,ylim=c(0,max(ds$y,ys[-1])),type="l",xlab="Km/h",ylab="",
+     col=asm.col,lwd=2)
+lines(ds,col=mn.col)
+c(mean(pr.spd),sd(pr.spd))
+```
+
+The posterior distribution of SST is compared to the observed SST.
+```{r}
+reynolds <- sstTable(model$time,xlim=xlim,ylim=ylim,land=F,
+                      src="Reynolds",path="SGAT")
+pr.sst <- chainApply(fit$x,reynolds$sst)
+qs <- t(apply(pr.sst,1,quantile,prob=c(0.025,0.975), na.rm=TRUE))
+plot(model$time,qs[,2],ylim=c(0,max(qs)),type="n",
+     ylab="SST",xlab="",xaxt="n",cex.axis=0.7)
+polygon(c(model$time,rev(model$time)),c(qs[,2],rev(qs[,1])),
+        col=ci.col,border=NA)
+axis.POSIXct(1,at=seq(round(min(model$time),"day"),
+                   round(max(model$time),"day"),"months"),
+             format="%d %b",las=2,cex.axis=0.7)
+points(twl$Twilight,twl$SST,pch=16,cex=0.5,col=mn.col)
+```
+
+
+## Summary
+
+The optimal estimates are obtained by combining results from the four chains.
+```{r,fig.show='hold'}
+opar <- par(mfrow=c(2,1),mar=c(4,5,2,1)+0.1)
+s <- locationSummary(fit$x,time=model$time)
+matplot(s$Time,s[,c("Lon.mean","Lon.2.5%","Lon.97.5%")],
+        type="l",lty=1,ylab="Lon",xaxt="n",xlab="",cex.axis=0.7,
+        col=c(mn.col,ci.col,ci.col))
+axis.POSIXct(1,at=seq(round(min(s$Time),"day"),
+                      round(max(s$Time),"day"),"months"),
+             format="%d %b",las=2,cex.axis=0.7)
+matplot(s$Time,s[,c("Lat.mean","Lat.2.5%","Lat.97.5%")],
+        type="l",lty=1,ylab="Lat",xaxt="n",xlab="",cex.axis=0.7,
+        col=c(mn.col,ci.col,ci.col))
+axis.POSIXct(1,at=seq(round(min(s$Time),"day"),
+                      round(max(s$Time),"day"),"months"),
+             format="%d %b",las=2,cex.axis=0.7)
+par(opar)
+```
+
+More typically we are interested in projecting the samples onto a
+map. The following function weights and bins samples to form weighted,
+two dimensional frequency table.  The `locationImage` function can be
+used to compute the posterior distribution of time spent at a location
+by binning the z locations weighted by the time intervals between
+twilights. To prevent the fixed locations from dominating the image
+(as they are so localized), the fixed z locations are weighted out
+```{r}
+library(maptools)
+data(wrld_simpl)
+fixedz <- fixed[-length(fixed)] > 0 & fixed[-length(fixed)]==fixed[-1]
+dt <- ifelse(fixedz,0,diff(as.numeric(model$time)/3600))
+im <- locationImage(fit$z,xlim=xlim,ylim=ylim,nx=4*diff(xlim),ny=4*diff(ylim),
+                    weight=dt)
+image(im$x,im$y,im$W,xlab="Lon",ylab="Lat",cex.axis=0.7, xlim=xlim0,ylim=ylim0)
+plot(wrld_simpl,add=T,col=map1.col,border=map2.col)
+plot(elide(wrld_simpl,shift=c(360,0)),add=T,col=map1.col,border=map2.col)
+points(fixed.locations, pch=16, cex=1)
+box()
+```
+
+We can plot mean positions along the track
+```{r}
+xm <- locationMean(fit$x)
+plot(xm,type="n",xlab="",ylab="",cex.axis=0.7, xlim=xlim0,ylim=ylim0)
+plot(wrld_simpl,add=T,col=map1.col,border=map2.col)
+plot(elide(wrld_simpl,shift=c(360,0)),add=T,col=map1.col,border=map2.col)
+lines(xm,col=rgb(t(col2rgb(trk.col))/255,alpha=0.2))
+points(xm,pch=16,cex=0.5,col=rgb(t(col2rgb(trk.col))/255,alpha=0.2))
+points(fixed.locations, pch=16, cex=1)
+box()
+```
+
+The track can be sliced into convenient intervals and each shown in turn
+```{r}
+r <- raster(nrows=4*diff(ylim0),ncols=4*diff(xlim0),xmn=xlim0[1],xmx=xlim0[2],
+            ymn=ylim0[1],ymx=ylim0[2])
+s <- slices(type="intermediate",breaks="month",mcmc=fit,grid=r)
+for(k in sliceIndices(s)) {
+  tm <- sliceInterval(s,k)
+  sk <- slice(s,k)
+  plot(sk,useRaster=F,main=sprintf("%s - %s",as.Date(tm[1]),as.Date(tm[2])),
+       cex.axis=0.7, xlim=xlim0,ylim=ylim0)
+  plot(wrld_simpl,add=T,col=map1.col,border=map2.col)
+  plot(elide(wrld_simpl,shift=c(360,0)),add=T,col=map1.col,border=map2.col)
+  points(fixed.locations, pch=16, cex=1)
+  box()
+}
+```
+
+
+```{r}
+colnames(xm) <- c("Lon","Lat")
+write.csv(cbind.data.frame(time=twl$Twilight,xm),
+          paste0("GLS_files/", tag, "/", tagdata,"_1estelleSST.csv"),
+          row.names=FALSE)
+save(fit,file=paste0("GLS_files/", tag, "/", tagdata,"_fitSST.RData"))
+##Saving Estelle output
+write.csv(locationSummary(fit$x,time=fit$model$time),
+          paste0("GLS_files/", tag, "/", tagdata,"_2estelleSST.csv"),
+          row.names=FALSE)
+toc()
+```
+
+<!--
+```{r VersionInfo,results='asis',echo=FALSE}
+cat(R.version.string,"\n",
+    "SGAT: ",as.character(packageVersion("SGAT")),"\n",
+    "BAStag: ",as.character(packageVersion("BAStag")),sep="")
+```
+-->

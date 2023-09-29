@@ -1,0 +1,160 @@
+---
+title: "Essie"
+output: html_document
+---
+```{r "setup", include=FALSE}
+require("knitr")
+opts_knit$set(root.dir = 
+                "D:\\BOULOT\\Projects\\Xmas\\Abbotts\\DATA\\CLEANING\\ABBOTTS")
+
+```
+
+#We assume that the data have been preprocessed to produce a suitable
+#set of twilight data and a consistent initial path.
+
+#Load `SGAT` and `BAStag`
+```{r}
+library(SGAT)
+library(raster)
+source("SGAT/colours.r")
+```
+
+## Configuration
+
+Load basic configuration info.  We don't actually need a detailed
+initial path, `x0` is only used for the fixed points.
+```{r}
+source("GLS_files/4063/4063_2_config.r")
+if(diff(range(xlim))>360) xlim <- c(0,360)
+twl <- read.csv(paste0("GLS_files/", tag, "/", tagdata, "_twilight.csv"),header=T)
+twl$Twilight <- as.POSIXct(twl$Twilight,"GMT")
+path <- read.csv(paste0("GLS_files/", tag, "/", tagdata, "_path.csv"), header=T)
+path <- list(time=as.POSIXct(path$time,"GMT"),x=cbind(path$lon,path$lat))
+fixed <- ifelse(twl$Marker <= nrow(fixed.locations),twl$Marker,0)
+```
+
+## Model Parameters
+
+Set the model parameters controlling the speed distribution and the
+distribution of twilight errors
+```{r}
+threshold
+zenith
+zenith0
+alpha
+beta
+```
+
+Create the raster that defines the grid
+```{r}
+library(maptools)
+data("wrld_simpl")
+## Cells per degree
+n <- 1
+grid <- raster(nrows=n*diff(ylim),ncols=n*diff(xlim),
+               xmn=xlim[1],xmx=xlim[2],ymn=ylim[1],ymx=ylim[2],
+               crs=proj4string(wrld_simpl))
+grid <- cover(rasterize(elide(wrld_simpl,shift=c(360,0)),grid,1,silent=TRUE),
+              rasterize(wrld_simpl,grid,1,silent=TRUE))
+## Mask must be non-zero for sea
+grid <- is.na(grid)
+plot(grid)
+```
+
+## SST
+
+Incorporate a contribution to the likelihood that assumes
+the observed sea surface temperature is Normally distributed about
+remotely sensed SST.
+```{r}
+sst <- stack("SGAT/sst.wkmean.1990-present.nc",varname="sst",quick=TRUE)
+indices <- .bincode(twl$Twilight,as.POSIXct(strptime(getZ(sst),"%Y-%m-%d","GMT"),
+                                            "GMT"),right=FALSE)
+logp0 <- function(k,x) {
+  x[,1] <- x[,1]%%360
+  if(is.na(twl$SST[k])) {
+    0
+  } else {
+    dnorm(twl$SST[k],extract(sst[[indices[k]]],x),2,log=T)
+  }
+}
+```
+
+## Model Fit
+
+We extract the initial path x0 and the fixed locations
+```{r}
+fixed <- fixed > 0
+x0 <- as.matrix(path$x)
+```
+
+Define a model
+```{r}
+model <- essieThresholdModel(twl$Twilight,twl$Rise, twilight.model = "LogNormal",
+                               alpha=alpha,beta=beta,
+                               logp0=logp0,
+                               x0=x0,fixed=fixed,zenith=zenith0,)
+```
+
+Fit the model
+```{r}
+fit <- essie(model,grid,epsilon1=1.0E-4)
+```
+
+## Summary
+
+Compare the final maximum a posteriori (map) estimate with the map
+estimate from just the forward and backward passes.  If these were not
+in loose agreement, we would be concerned about the fitted path.
+```{r,fig.show='hold'}
+opar <- par(mfrow=c(2,2))
+plot(fit$grid,legend=FALSE,col=c(map1.col,"white"),main="Track")
+lines(essieMode(fit)$x,type="l",col=trk.col)
+plot(fit$grid,legend=FALSE,col=c(map1.col,"white"),main="Forward")
+lines(essieMode(fit,type="forward")$x,type="l",col=trk.col)
+plot(fit$grid,legend=FALSE,col=c(map1.col,"white"),main="Backward")
+lines(essieMode(fit,type="backward")$x,type="l",col=trk.col)
+par(opar)
+```
+
+Compare the final posterior mean estimate with the estimate from just
+the forward and backward passes.  Again, if these were not in loose
+agreement, we would be concerned about the fitted path.
+```{r,fig.show='hold'}
+opar <- par(mfrow=c(2,2))
+plot(fit$grid,legend=FALSE,col=c(map1.col,"white"),main="Track")
+lines(essieMean(fit)$x,type="l",col=trk.col)
+plot(fit$grid,legend=FALSE,col=c(map1.col,"white"),main="Forward")
+lines(essieMean(fit,type="forward")$x,type="l",col=trk.col)
+plot(fit$grid,legend=FALSE,col=c(map1.col,"white"),main="Backward")
+lines(essieMean(fit,type="backward")$x,type="l",col=trk.col)
+par(opar)
+```
+
+Plot the posterior for a selection of times
+```{r,fig.show='hold'}
+opar <- par(mfrow=c(2,2),mar=c(3,3,4,1))
+ks <- round(seq(1,length(model$time),length=9)[c(2,4,6,8)])
+for(k in ks) {
+  plot(fit$grid,legend=FALSE,col=c(map1.col,"white"),main=fit$time[k])
+  plot(essieRaster(fit,k),add=T)
+}
+par(opar)
+```
+
+Write the estimated track (the sequence of posterior modes) adjusted
+for fixed locations
+```{r}
+path <- essieMean(fit)
+path$x[fixed > 0,] <- x0[fixed > 0,]
+write.csv(cbind.data.frame(time=path$time,path$x),
+          paste0("GLS_files/", tag, "/", tagdata,"_essieSST.csv"),row.names=FALSE)
+```
+
+<!--
+```{r VersionInfo,results='asis',echo=FALSE}
+cat(R.version.string,"\n",
+    "SGAT: ",as.character(packageVersion("SGAT")),"\n",
+    "BAStag: ",as.character(packageVersion("BAStag")),sep="")
+```
+-->
